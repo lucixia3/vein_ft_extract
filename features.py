@@ -1,38 +1,4 @@
-#!/usr/bin/env python3
-"""
-Extract per-label venous features from paired brain CTA and vein segmentation files.
 
-Expected default project structure:
-/project
-├── scripts/
-│   └── process_vein_features.py
-├── cases/
-│   ├── cta/
-│   │   ├── sub-stroke_0002_ct.nii.gz
-│   │   └── ...
-│   └── segments/
-│       ├── sub-stroke_0002_seg.nii.gz
-│       └── ...
-└── results/
-    ├── TotalSegmentator/
-│   │   └── <case_id>/
-│   ├── <case_id>/
-│   │   ├── icv_mask_<case_id>.nii.gz
-│   │   └── <case_id>.csv
-│   ├── vein_features_all_cases.csv
-│   └── failed_cases.csv
-
-Examples
---------
-Process all matched cases:
-    python process_vein_features.py
-
-Process selected cases:
-    python process_vein_features.py --case-id sub-stroke_0002 sub-stroke_0004
-
-Force re-running TotalSegmentator for selected cases:
-    python process_vein_features.py --case-id sub-stroke_0002 --force-totalseg
-"""
 
 from __future__ import annotations
 
@@ -61,13 +27,18 @@ import gc
 import subprocess
 import traceback
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 from typing import Dict, List, Sequence, Tuple
 
 import nibabel as nib
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
-from skimage.morphology import skeletonize
+
+from skeleton_metrics import skeleton_extended_diameter_stats_mm
 
 
 LABEL_DICT: Dict[int, str] = {
@@ -234,20 +205,6 @@ def build_icv_mask(ts_dir: Path, vein_mask: np.ndarray) -> np.ndarray:
     return icv_mask
 
 
-def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, float, float]) -> Tuple[float, float]:
-    if np.count_nonzero(mask) == 0:
-        return float("nan"), float("nan")
-
-    distance_map = ndi.distance_transform_edt(mask, sampling=spacing)
-    skeleton = skeletonize(mask)
-    diameters = 2.0 * distance_map[skeleton]
-
-    if diameters.size == 0:
-        return float("nan"), float("nan")
-
-    return float(np.max(diameters)), float(np.std(diameters))
-
-
 def extract_case_features(
     case_id: str,
     cta_path: Path,
@@ -286,7 +243,14 @@ def extract_case_features(
         values = cta[mask]
         n_components = int(ndi.label(mask)[1])
         volume_mm3 = float(np.count_nonzero(mask) * voxel_volume_mm3)
-        max_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(mask, spacing)
+        dia = skeleton_extended_diameter_stats_mm(mask, spacing)
+        if values.size > 0:
+            min_hu = float(np.min(values))
+            max_hu = float(np.max(values))
+            p10_hu = float(np.percentile(values, 10))
+            p90_hu = float(np.percentile(values, 90))
+        else:
+            min_hu = max_hu = p10_hu = p90_hu = float("nan")
 
         rows.append(
             {
@@ -297,10 +261,20 @@ def extract_case_features(
                 "total_vein_volume_mm3": total_vein_volume_mm3,
                 "icv_volume_mm3": icv_volume_mm3,
                 "n_connected_components": n_components,
-                "mean_hu_abs": float(np.mean(values)),
-                "std_hu_abs": float(np.std(values)),
-                "max_diameter_mm": max_diameter_mm,
-                "std_diameter_mm": std_diameter_mm,
+                "mean_hu_abs": float(np.mean(values)) if values.size > 0 else float("nan"),
+                "std_hu_abs": float(np.std(values)) if values.size > 0 else float("nan"),
+                "min_hu_abs": min_hu,
+                "max_hu_abs": max_hu,
+                "p10_hu_abs": p10_hu,
+                "p90_hu_abs": p90_hu,
+                "max_diameter_mm": dia["max_diameter_mm"],
+                "min_diameter_mm": dia["min_diameter_mm"],
+                "mean_diameter_mm": dia["mean_diameter_mm"],
+                "median_diameter_mm": dia["median_diameter_mm"],
+                "std_diameter_mm": dia["std_diameter_mm"],
+                "p10_diameter_mm": dia["p10_diameter_mm"],
+                "p90_diameter_mm": dia["p90_diameter_mm"],
+                "n_skeleton_voxels": dia["n_skeleton_voxels"],
             }
         )
 
@@ -337,12 +311,22 @@ def extract_case_features(
             "n_connected_components",
             "mean_hu_abs",
             "std_hu_abs",
+            "min_hu_abs",
+            "max_hu_abs",
+            "p10_hu_abs",
+            "p90_hu_abs",
             "mean_hu_ref_sss",
             "std_hu_ref_sss",
             "volume_fraction_all_veins_percent",
             "volume_fraction_icv_percent",
             "max_diameter_mm",
+            "min_diameter_mm",
+            "mean_diameter_mm",
+            "median_diameter_mm",
             "std_diameter_mm",
+            "p10_diameter_mm",
+            "p90_diameter_mm",
+            "n_skeleton_voxels",
         ]
     ]
 

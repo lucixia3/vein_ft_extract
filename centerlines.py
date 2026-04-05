@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import nibabel as nib
 
+from graph_utils import filter_nodes_incident_to_edges, save_bridges_for_label_dir
+
 warnings.filterwarnings("ignore")
 
 logging.basicConfig(
@@ -150,6 +152,64 @@ def voxel_to_mm(voxels_ijk, affine):
     return (affine @ ijk1.T).T[:, :3]
 
 
+def mm_to_voxel_array_indices(pts_mm, affine):
+    """Inverso coherente con voxel_to_mm: pts mm -> índices (dim0,dim1,dim2) del array."""
+    pts_mm = np.asarray(pts_mm, dtype=float).reshape(-1, 3)
+    if len(pts_mm) == 0:
+        return np.empty((0, 3), dtype=int)
+    hom = np.concatenate([pts_mm, np.ones((len(pts_mm), 1))], axis=1)
+    vox_mix = (np.linalg.inv(affine) @ hom.T).T[:, :3]
+    ijk = np.stack([vox_mix[:, 2], vox_mix[:, 1], vox_mix[:, 0]], axis=1)
+    return np.round(ijk).astype(np.int32)
+
+
+def diameter_sampled_along_branches_mm(branches, comp_mask, affine, spacing):
+    """Diámetro local (2*EDT) en mm en cada punto de centerline, misma máscara que el comp."""
+    from scipy import ndimage as ndi
+
+    sp = tuple(float(s) for s in spacing)
+    edt = ndi.distance_transform_edt(comp_mask.astype(bool), sampling=sp)
+    shape = comp_mask.shape
+    out = []
+    for pts in branches:
+        ijk = mm_to_voxel_array_indices(pts, affine)
+        d = np.full(len(pts), np.nan, dtype=float)
+        for i in range(len(pts)):
+            ii, jj, kk = int(ijk[i, 0]), int(ijk[i, 1]), int(ijk[i, 2])
+            if 0 <= ii < shape[0] and 0 <= jj < shape[1] and 0 <= kk < shape[2]:
+                d[i] = float(2.0 * edt[ii, jj, kk])
+        out.append(d)
+    return out
+
+
+def cta_matches_segmentation(cta_nii, seg_shape: tuple, seg_affine: np.ndarray) -> bool:
+    sh = tuple(int(x) for x in cta_nii.shape[:3])
+    if sh != tuple(int(x) for x in seg_shape[:3]):
+        return False
+    return bool(np.allclose(cta_nii.affine, seg_affine, rtol=1e-5, atol=1e-4))
+
+
+def hu_sampled_along_branches(cta_data: np.ndarray, affine: np.ndarray, branches):
+    """HU del CTA (interpolación orden 1) en cada punto de centerline, mm -> vox."""
+    from scipy.ndimage import map_coordinates
+
+    inv = np.linalg.inv(affine)
+    out: list[np.ndarray] = []
+    for pts in branches:
+        pts = np.asarray(pts, dtype=float).reshape(-1, 3)
+        if len(pts) == 0:
+            out.append(np.array([], dtype=float))
+            continue
+        hom = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+        vox_mix = (inv @ hom.T).T[:, :3]
+        ijk = np.stack([vox_mix[:, 2], vox_mix[:, 1], vox_mix[:, 0]], axis=0)
+        vals = map_coordinates(
+            np.asarray(cta_data, dtype=float), ijk, order=1, mode="nearest"
+        )
+        out.append(vals.astype(float))
+    return out
+
+
 def smooth_centerline(pts, sigma=2.0):
     from scipy.ndimage import gaussian_filter1d
     if len(pts) < 5:
@@ -161,10 +221,33 @@ def smooth_centerline(pts, sigma=2.0):
     ])
 
 
-def skeleton_to_branches_multi(skel, affine, spacing, min_branch_mm=5.0):
+def _walk_to_next_special(adj, special, start_nb, from_node):
+    """Camina desde start_nb hasta el siguiente nodo especial (grafo de esqueleto)."""
+    p = [from_node, start_nb]
+    curr, previous = start_nb, from_node
+    while True:
+        if curr in special and curr != from_node:
+            break
+        nbs = [n for n in adj[curr] if n != previous]
+        if not nbs:
+            break
+        if len(nbs) > 1:
+            break
+        previous, curr = curr, nbs[0]
+        p.append(curr)
+    return p
+
+
+def skeleton_to_branches_multi_with_graph(
+    skel, affine, spacing, min_branch_mm=5.0, smooth_sigma=2.0
+):
+    """
+    Ramas entre nodos especiales (grado 1 o >=3) + tablas de nodos y aristas.
+    Los nodos son bifurcaciones y extremos del esqueleto (donde se juntan ramas).
+    """
     voxels, adj = build_graph(skel)
     if len(voxels) == 0:
-        return []
+        return [], pd.DataFrame(), pd.DataFrame()
     degrees = {i: len(nb) for i, nb in adj.items()}
     special = set(i for i, d in degrees.items() if d == 1 or d >= 3)
     if not special:
@@ -172,31 +255,35 @@ def skeleton_to_branches_multi(skel, affine, spacing, min_branch_mm=5.0):
         dists = np.linalg.norm(voxels - centroid, axis=1)
         special = {int(np.argmax(dists))}
 
-    branches = []
-    visited_pairs = set()
+    special_sorted = sorted(special)
+    gid_to_nid = {gid: nid for nid, gid in enumerate(special_sorted)}
+    nodes_rows = []
+    for gid in special_sorted:
+        xyz = voxel_to_mm(voxels[[gid]], affine)[0]
+        deg = int(degrees[gid])
+        role = "junction" if deg >= 3 else "endpoint"
+        nodes_rows.append(
+            {
+                "node_id": gid_to_nid[gid],
+                "graph_vertex_id": int(gid),
+                "degree": deg,
+                "role": role,
+                "x": float(xyz[0]),
+                "y": float(xyz[1]),
+                "z": float(xyz[2]),
+            }
+        )
+    nodes_df = pd.DataFrame(nodes_rows)
 
-    def walk_to_next_special(start_nb, from_node):
-        """Camina desde start_nb hasta el siguiente nodo especial."""
-        p = [from_node, start_nb]
-        curr, previous = start_nb, from_node
-        while True:
-            if curr in special and curr != from_node:
-                break
-            nbs = [n for n in adj[curr] if n != previous]
-            if not nbs:
-                break
-            if len(nbs) > 1:
-                # bifurcacion — el propio curr es un nodo especial no detectado
-                break
-            previous, curr = curr, nbs[0]
-            p.append(curr)
-        return p
+    branches = []
+    branch_rows = []
+    visited_pairs = set()
+    bid = 0
 
     for node in special:
         for nb in adj[node]:
-            p = walk_to_next_special(nb, node)
+            p = _walk_to_next_special(adj, special, nb, node)
             end_node = p[-1]
-            # Clave canonica para evitar A->B y B->A
             pair = (min(node, end_node), max(node, end_node), len(p))
             if pair in visited_pairs:
                 continue
@@ -204,10 +291,77 @@ def skeleton_to_branches_multi(skel, affine, spacing, min_branch_mm=5.0):
             mm = voxel_to_mm(voxels[p], affine)
             length = float(np.linalg.norm(np.diff(mm, axis=0), axis=1).sum())
             if length >= min_branch_mm:
-                branches.append(smooth_centerline(mm))
+                pts = smooth_centerline(mm, smooth_sigma)
+                branches.append(pts)
+                branch_rows.append(
+                    {
+                        "branch_id": bid,
+                        "node_start": gid_to_nid[node],
+                        "node_end": gid_to_nid[end_node],
+                        "length_mm": round(length, 4),
+                    }
+                )
+                bid += 1
 
-    log.info(f"    Ramas (multi): {len(branches)}")
+    log.info(f"    Ramas (multi): {len(branches)}  |  nodos: {len(nodes_df)}")
+    return branches, nodes_df, pd.DataFrame(branch_rows)
+
+
+def skeleton_to_branches_multi(skel, affine, spacing, min_branch_mm=5.0):
+    branches, _, _ = skeleton_to_branches_multi_with_graph(
+        skel, affine, spacing, min_branch_mm=min_branch_mm
+    )
     return branches
+
+
+def single_branch_with_graph(voxels, adj, spacing, affine, smooth_sigma=2.0):
+    """Una sola rama (camino mas largo) y dos nodos en los extremos."""
+    path_ids = find_longest_path(voxels, adj, spacing)
+    if not path_ids:
+        return [], pd.DataFrame(), pd.DataFrame()
+    pts_mm = smooth_centerline(
+        voxel_to_mm(voxels[path_ids], affine), smooth_sigma
+    )
+    branches = [pts_mm]
+    n0, n1 = int(path_ids[0]), int(path_ids[-1])
+    p0 = voxel_to_mm(voxels[[n0]], affine)[0]
+    p1 = voxel_to_mm(voxels[[n1]], affine)[0]
+    d0, d1 = len(adj[n0]), len(adj[n1])
+    nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": 0,
+                "graph_vertex_id": n0,
+                "degree": d0,
+                "role": "endpoint",
+                "x": float(p0[0]),
+                "y": float(p0[1]),
+                "z": float(p0[2]),
+            },
+            {
+                "node_id": 1,
+                "graph_vertex_id": n1,
+                "degree": d1,
+                "role": "endpoint",
+                "x": float(p1[0]),
+                "y": float(p1[1]),
+                "z": float(p1[2]),
+            },
+        ]
+    )
+    length_mm = float(np.linalg.norm(np.diff(pts_mm, axis=0), axis=1).sum())
+    edges_df = pd.DataFrame(
+        [
+            {
+                "branch_id": 0,
+                "node_start": 0,
+                "node_end": 1,
+                "length_mm": round(length_mm, 4),
+            }
+        ]
+    )
+    log.info(f"    Nodos (single): 2 extremos  |  longitud rama: {length_mm:.2f} mm")
+    return branches, nodes_df, edges_df
 
 
 def compute_curvature(pts):
@@ -239,33 +393,74 @@ def compute_torsion(pts):
     return out
 
 
-def branches_to_dataframe(branches, label, comp_id):
+def branches_to_dataframe(
+    branches,
+    label,
+    comp_id,
+    diameter_per_branch=None,
+    hu_per_branch=None,
+):
     rows = []
     for bid, pts in enumerate(branches):
         curv, tors = compute_curvature(pts), compute_torsion(pts)
-        for i, (x,y,z) in enumerate(pts):
-            rows.append({"label":label,"component":comp_id,"branch_id":bid,
-                         "point_id":i,"x":x,"y":y,"z":z,
-                         "curvature": float(curv[i]) if not np.isnan(curv[i]) else np.nan,
-                         "torsion":   float(tors[i]) if not np.isnan(tors[i]) else np.nan})
+        diam = diameter_per_branch[bid] if diameter_per_branch is not None else None
+        hu_b = hu_per_branch[bid] if hu_per_branch is not None else None
+        for i, (x, y, z) in enumerate(pts):
+            row = {
+                "label": label,
+                "component": comp_id,
+                "branch_id": bid,
+                "point_id": i,
+                "x": x,
+                "y": y,
+                "z": z,
+                "curvature": float(curv[i]) if not np.isnan(curv[i]) else np.nan,
+                "torsion": float(tors[i]) if not np.isnan(tors[i]) else np.nan,
+            }
+            if diam is not None:
+                row["diameter_mm"] = (
+                    float(diam[i]) if not np.isnan(diam[i]) else np.nan
+                )
+            if hu_b is not None and i < len(hu_b):
+                row["hu"] = float(hu_b[i]) if not np.isnan(hu_b[i]) else np.nan
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 def compute_branch_stats(df):
     records = []
-    for (label,comp,bid), grp in df.groupby(["label","component","branch_id"]):
-        pts = grp[["x","y","z"]].values
+    for (label, comp, bid), grp in df.groupby(["label", "component", "branch_id"]):
+        pts = grp[["x", "y", "z"]].values
         length_mm = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
-        euclidean = float(np.linalg.norm(pts[-1]-pts[0])) if len(pts)>1 else 0.0
-        tortuosity = (length_mm/euclidean) if euclidean > 0 else np.nan
-        records.append({"label":label,"component":comp,"branch_id":bid,
-                        "n_points":len(grp),
-                        "length_mm":round(length_mm,3),
-                        "euclidean_mm":round(euclidean,3),
-                        "tortuosity":round(tortuosity,4) if not np.isnan(tortuosity) else np.nan,
-                        "curvature_mean":round(grp["curvature"].mean(),5),
-                        "curvature_max":round(grp["curvature"].max(),5),
-                        "torsion_mean":round(grp["torsion"].mean(),5)})
+        euclidean = float(np.linalg.norm(pts[-1] - pts[0])) if len(pts) > 1 else 0.0
+        tortuosity = (length_mm / euclidean) if euclidean > 0 else np.nan
+        rec = {
+            "label": label,
+            "component": comp,
+            "branch_id": bid,
+            "n_points": len(grp),
+            "length_mm": round(length_mm, 3),
+            "euclidean_mm": round(euclidean, 3),
+            "tortuosity": round(tortuosity, 4) if not np.isnan(tortuosity) else np.nan,
+            "curvature_mean": round(grp["curvature"].mean(), 5),
+            "curvature_max": round(grp["curvature"].max(), 5),
+            "torsion_mean": round(grp["torsion"].mean(), 5),
+        }
+        if "diameter_mm" in grp.columns and grp["diameter_mm"].notna().any():
+            g = grp["diameter_mm"].dropna()
+            rec["diameter_min_mm"] = round(float(g.min()), 4)
+            rec["diameter_max_mm"] = round(float(g.max()), 4)
+            rec["diameter_mean_mm"] = round(float(g.mean()), 4)
+            rec["diameter_std_mm"] = (
+                round(float(g.std()), 4) if len(g) > 1 else 0.0
+            )
+        if "hu" in grp.columns and grp["hu"].notna().any():
+            h = grp["hu"].dropna()
+            rec["hu_min"] = round(float(h.min()), 2)
+            rec["hu_max"] = round(float(h.max()), 2)
+            rec["hu_mean"] = round(float(h.mean()), 2)
+            rec["hu_std"] = round(float(h.std()), 2) if len(h) > 1 else 0.0
+        records.append(rec)
     return pd.DataFrame(records)
 
 
@@ -307,9 +502,28 @@ def save_vtp(branches, path):
         log.warning(f"  VTP no guardado: {e}")
 
 
-def run_pipeline(input_path, output_dir, target_labels=None, mode="single",
-                 prune_voxels=20, smooth_sigma=2.0, min_branch_mm=5.0,
-                 min_voxels=50, save_skeleton=False):
+def run_pipeline(
+    input_path,
+    output_dir,
+    target_labels=None,
+    mode="single",
+    label_modes=None,
+    prune_voxels=20,
+    smooth_sigma=2.0,
+    min_branch_mm=5.0,
+    min_voxels=50,
+    save_skeleton=False,
+    bridge_max_mm=45.0,
+    bridge_labels=(9, 10),
+    cta_path=None,
+):
+    """
+    Si label_modes es un dict {label: 'single'|'multi'}, se usa ese modo por etiqueta
+    y se ignoran target_labels/mode por defecto salvo que label_modes sea None.
+
+    bridge_labels: en modo multi, tras procesar la etiqueta se calculan puentes heuristicos
+    entre componentes conectadas-disjuntas (mm) y se guarda graph_bridges.csv.
+    """
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -318,14 +532,32 @@ def run_pipeline(input_path, output_dir, target_labels=None, mode="single",
     log.addHandler(fh)
 
     data, affine, spacing, all_labels = load_segmentation(input_path)
-    labels_to_process = target_labels if target_labels else all_labels
+
+    cta_arr = None
+    if cta_path:
+        cn = nib.load(str(cta_path))
+        if cta_matches_segmentation(cn, data.shape, affine):
+            cta_arr = cn.get_fdata().astype(np.float32)
+            log.info(f"CTA alineado con segmentación (HU en centerlines): {cta_path}")
+        else:
+            log.warning(
+                f"CTA no coincide en shape/affine con la segmentación; se omite HU. "
+                f"cta={cn.shape[:3]} seg={data.shape}"
+            )
+
+    if label_modes is not None:
+        labels_to_process = sorted(label_modes.keys())
+    else:
+        labels_to_process = target_labels if target_labels else all_labels
     all_pts, all_stats = [], []
+    all_nodes, all_edges = [], []
 
     for label in labels_to_process:
+        eff_mode = label_modes[label] if label_modes else mode
         if label not in all_labels:
             log.warning(f"Label {label} no se encuentra, saltando")
             continue
-        log.info(f"\n{'='*60}\nLabel {label}  [modo={mode}]\n{'='*60}")
+        log.info(f"\n{'='*60}\nLabel {label}  [modo={eff_mode}]\n{'='*60}")
         mask = (data == label).astype(np.uint8)
         components = get_components(mask)
         log.info(f"  COmponents: {len(components)}")
@@ -349,20 +581,50 @@ def run_pipeline(input_path, output_dir, target_labels=None, mode="single",
             if skel.sum() == 0:
                 log.warning(" skeleton buid")
                 continue
-            if mode == "single":
+            if eff_mode == "single":
                 voxels, adj = build_graph(skel)
-                path_ids = find_longest_path(voxels, adj, spacing)
-                if not path_ids:
-                    continue
-                pts_mm = smooth_centerline(voxel_to_mm(voxels[path_ids], affine), smooth_sigma)
-                branches = [pts_mm]
+                branches, nodes_df, edges_df = single_branch_with_graph(
+                    voxels, adj, spacing, affine, smooth_sigma
+                )
             else:
-                branches = skeleton_to_branches_multi(skel, affine, spacing, min_branch_mm)
+                branches, nodes_df, edges_df = skeleton_to_branches_multi_with_graph(
+                    skel, affine, spacing, min_branch_mm, smooth_sigma
+                )
             if not branches:
                 log.warning("    Sin ramas validas.")
                 continue
+            if not nodes_df.empty and not edges_df.empty:
+                nodes_df, edges_df = filter_nodes_incident_to_edges(
+                    nodes_df, edges_df
+                )
             save_vtp(branches, f"{prefix}_centerlines.vtp")
-            df_pts = branches_to_dataframe(branches, label, comp_id)
+            if not nodes_df.empty:
+                nd = nodes_df.copy()
+                nd.insert(0, "component", comp_id)
+                nd.insert(0, "label", label)
+                save_csv(nd, f"{prefix}_graph_nodes.csv")
+                all_nodes.append(nd)
+            if not edges_df.empty:
+                ed = edges_df.copy()
+                ed.insert(0, "component", comp_id)
+                ed.insert(0, "label", label)
+                save_csv(ed, f"{prefix}_graph_edges.csv")
+                all_edges.append(ed)
+            diam_list = diameter_sampled_along_branches_mm(
+                branches, comp_mask.astype(bool), affine, spacing
+            )
+            hu_list = (
+                hu_sampled_along_branches(cta_arr, affine, branches)
+                if cta_arr is not None
+                else None
+            )
+            df_pts = branches_to_dataframe(
+                branches,
+                label,
+                comp_id,
+                diameter_per_branch=diam_list,
+                hu_per_branch=hu_list,
+            )
             save_csv(df_pts, f"{prefix}_centerlines.csv")
             all_pts.append(df_pts)
             df_stats = compute_branch_stats(df_pts)
@@ -371,11 +633,27 @@ def run_pipeline(input_path, output_dir, target_labels=None, mode="single",
             log.info(f"    Ramas: {len(branches)}  |  Puntos: {len(df_pts)}")
             log.info(df_stats.to_string(index=False))
 
+        if label in bridge_labels and eff_mode == "multi":
+            save_bridges_for_label_dir(label_dir, label, max_bridge_mm=bridge_max_mm)
+            bp = label_dir / "graph_bridges.csv"
+            if bp.exists():
+                log.info(f"  Puentes inter-componente guardados: {bp}")
+
     if all_pts:
-        save_csv(pd.concat(all_pts,   ignore_index=True), str(out/"all_centerlines.csv"))
+        save_csv(pd.concat(all_pts, ignore_index=True), str(out / "all_centerlines.csv"))
     if all_stats:
-        save_csv(pd.concat(all_stats, ignore_index=True), str(out/"all_branch_stats.csv"))
+        save_csv(pd.concat(all_stats, ignore_index=True), str(out / "all_branch_stats.csv"))
+    if all_nodes:
+        save_csv(
+            pd.concat(all_nodes, ignore_index=True), str(out / "all_graph_nodes.csv")
+        )
+    if all_edges:
+        save_csv(
+            pd.concat(all_edges, ignore_index=True), str(out / "all_graph_edges.csv")
+        )
     log.info(f"\nPipeline completo. Outputs en: {output_dir}")
+    log.removeHandler(fh)
+    fh.close()
 
 
 def parse_args():
@@ -393,19 +671,26 @@ def parse_args():
                    help="Longitud minima de rama en modo multi, mm (default: 5.0)")
     p.add_argument("--min-voxels",    type=int,   default=50)
     p.add_argument("--save-skeleton", action="store_true")
+    p.add_argument(
+        "--cta",
+        type=str,
+        default=None,
+        help="NIfTI CTA (misma shape/affine que la segmentación) para columna hu en centerlines.",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     run_pipeline(
-        input_path    = args.input,
-        output_dir    = args.output,
-        target_labels = args.labels,
-        mode          = args.mode,
-        prune_voxels  = args.prune_voxels,
-        smooth_sigma  = args.smooth_sigma,
-        min_branch_mm = args.min_branch_mm,
-        min_voxels    = args.min_voxels,
-        save_skeleton = args.save_skeleton,
+        input_path=args.input,
+        output_dir=args.output,
+        target_labels=args.labels,
+        mode=args.mode,
+        prune_voxels=args.prune_voxels,
+        smooth_sigma=args.smooth_sigma,
+        min_branch_mm=args.min_branch_mm,
+        min_voxels=args.min_voxels,
+        save_skeleton=args.save_skeleton,
+        cta_path=args.cta,
     )
