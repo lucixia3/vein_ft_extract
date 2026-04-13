@@ -56,7 +56,7 @@ DISPLAY_LABELS = {
 }
 MISSING_FACE = "#bdbdbd"
 EDGE_COLOR = "#1f4ea8"
-BG_COLOR = "#e0e0e0"
+BG_COLOR = "white"
 PCT_LOW = 5.0
 PCT_HIGH = 95.0
 
