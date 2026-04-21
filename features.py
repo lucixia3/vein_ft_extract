@@ -36,8 +36,13 @@ Force re-running TotalSegmentator for selected cases:
 
 from __future__ import annotations
 
+import argparse
+import gc
 import os
+import subprocess
 import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 def check_conda_environment(required_env: str = "vmtk_env") -> None:
@@ -54,14 +59,7 @@ def check_conda_environment(required_env: str = "vmtk_env") -> None:
         )
 
 
-check_conda_environment("vmtk_env")
-
-import argparse
-import gc
-import subprocess
-import traceback
-from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+check_conda_environment()
 
 import nibabel as nib
 import numpy as np
@@ -69,7 +67,9 @@ import pandas as pd
 from scipy import ndimage as ndi
 from skimage.morphology import skeletonize
 
-
+# -----------------------------------------------------------------------------
+# Configuration Constants
+# -----------------------------------------------------------------------------
 LABEL_DICT: Dict[int, str] = {
     1: "VOG",
     2: "STS",
@@ -109,7 +109,9 @@ TOTALSEG_COMPLETENESS_MARKERS: List[str] = [
     "thalamus.nii.gz",
 ]
 
-
+# -----------------------------------------------------------------------------
+# Core Functions
+# -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -144,82 +146,61 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=None,
-        help=(
-            "One or more case IDs to process, for example: "
-            "--case-id sub-stroke_0002 sub-stroke_0004. "
-            "If omitted, all matched CTA/segmentation pairs are processed."
-        ),
+        help="One or more case IDs to process. Omit to process all matched pairs.",
     )
     parser.add_argument(
         "--force-totalseg",
         action="store_true",
-        help=(
-            "Re-run TotalSegmentator even if an apparently complete output folder already exists. "
-            "This mainly affects the regenerated TotalSegmentator masks, the saved ICV mask, "
-            "and downstream ICV-based quantities such as volume_fraction_icv_percent."
-        ),
+        help="Re-run TotalSegmentator even if complete output already exists.",
     )
     return parser.parse_args()
-
-
-def infer_case_id_from_cta_name(cta_name: str) -> str:
-    suffix = "_ct.nii.gz"
-    if not cta_name.endswith(suffix):
-        raise ValueError(f"Unexpected CTA filename: {cta_name}")
-    return cta_name[: -len(suffix)]
 
 
 def get_case_pairs(
     cta_dir: Path,
     seg_dir: Path,
-    selected_case_ids: set[str] | None = None,
+    selected_case_ids: Optional[Set[str]] = None,
 ) -> List[Tuple[str, Path, Path]]:
+    """Match CTA files with corresponding segmentation files."""
     pairs: List[Tuple[str, Path, Path]] = []
     for cta_path in sorted(cta_dir.glob("*_ct.nii.gz")):
-        case_id = infer_case_id_from_cta_name(cta_path.name)
-        if selected_case_ids is not None and case_id not in selected_case_ids:
+        case_id = cta_path.name.replace("_ct.nii.gz", "")
+        
+        if selected_case_ids and case_id not in selected_case_ids:
             continue
 
         seg_path = seg_dir / f"{case_id}_seg.nii.gz"
         if not seg_path.exists():
-            print(f"[WARNING] Missing segmentation for {cta_path.name}: {seg_path.name}")
+            print(f"[WARNING] Missing segmentation for {case_id}: {seg_path.name}")
             continue
+            
         pairs.append((case_id, cta_path, seg_path))
     return pairs
 
 
-def totalseg_outputs_look_complete(ts_dir: Path) -> bool:
-    return ts_dir.exists() and all((ts_dir / name).exists() for name in TOTALSEG_COMPLETENESS_MARKERS)
-
-
 def run_totalsegmentator(cta_path: Path, out_dir: Path, force: bool = False) -> bool:
-    """Run TotalSegmentator if needed. Returns True if it was executed, False if skipped."""
-    if not force and totalseg_outputs_look_complete(out_dir):
+    """Run TotalSegmentator if outputs are incomplete or force flag is used."""
+    is_complete = out_dir.exists() and all((out_dir / name).exists() for name in TOTALSEG_COMPLETENESS_MARKERS)
+    
+    if not force and is_complete:
         print(f"  TotalSegmentator outputs already exist and look complete: {out_dir}")
         return False
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "TotalSegmentator",
-        "-i",
-        str(cta_path),
-        "-o",
-        str(out_dir),
-        "--task",
-        "brain_structures",
-    ]
+    cmd = ["TotalSegmentator", "-i", str(cta_path), "-o", str(out_dir), "--task", "brain_structures"]
+    
     print("  Running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     return True
 
 
 def build_icv_mask(ts_dir: Path, vein_mask: np.ndarray) -> np.ndarray:
+    """Combine specific TotalSegmentator outputs and the vein mask to form the ICV mask."""
     reference_file = ts_dir / ICV_STRUCTURE_FILES[0]
     if not reference_file.exists():
         raise FileNotFoundError(f"Cannot build ICV mask because {reference_file} was not found.")
 
-    reference_img = nib.load(str(reference_file))
-    icv_mask = np.zeros(reference_img.shape, dtype=bool)
+    icv_mask = np.array(vein_mask, dtype=bool)
 
     for filename in ICV_STRUCTURE_FILES:
         path = ts_dir / filename
@@ -228,22 +209,34 @@ def build_icv_mask(ts_dir: Path, vein_mask: np.ndarray) -> np.ndarray:
         else:
             print(f"  [WARNING] Missing TotalSegmentator structure: {filename}")
 
-    icv_mask |= vein_mask
     return icv_mask
 
 
-def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, float, float]) -> Tuple[float, float]:
-    if np.count_nonzero(mask) == 0:
-        return float("nan"), float("nan")
+def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, ...]) -> Tuple[float, float, float, float]:
+    """Calculate max, mean, median, and std of diameters using Euclidean distance transform, robust to spurs."""
+    if not np.any(mask):
+        return float("nan"), float("nan"), float("nan"), float("nan")
 
     distance_map = ndi.distance_transform_edt(mask, sampling=spacing)
     skeleton = skeletonize(mask)
     diameters = 2.0 * distance_map[skeleton]
 
     if diameters.size == 0:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
 
-    return float(np.max(diameters)), float(np.std(diameters))
+    # Filter out near-zero values (likely skeleton spurs touching the surface)
+    min_valid_diameter = min(spacing)
+    valid_diameters = diameters[diameters > min_valid_diameter]
+
+    if valid_diameters.size == 0:
+        valid_diameters = diameters # Fallback if the whole vein is tiny
+
+    return (
+        float(np.max(valid_diameters)),
+        float(np.mean(valid_diameters)),
+        float(np.median(valid_diameters)),
+        float(np.std(valid_diameters))
+    )
 
 
 def extract_case_features(
@@ -253,6 +246,7 @@ def extract_case_features(
     ts_dir: Path,
     case_results_dir: Path,
 ) -> pd.DataFrame:
+    """Extract features for all present venous labels and calculate volume/density stats."""
     cta_nii = nib.load(str(cta_path))
     seg_nii = nib.load(str(seg_path))
 
@@ -260,7 +254,7 @@ def extract_case_features(
     seg = seg_nii.get_fdata().astype(np.int16)
 
     if cta.shape != seg.shape:
-        raise ValueError(f"Shape mismatch for {cta_path.name} and {seg_path.name}: {cta.shape} vs {seg.shape}")
+        raise ValueError(f"Shape mismatch for {case_id}: CTA {cta.shape} vs Seg {seg.shape}")
 
     spacing = tuple(float(x) for x in cta_nii.header.get_zooms()[:3])
     voxel_volume_mm3 = float(np.prod(spacing))
@@ -268,84 +262,105 @@ def extract_case_features(
     vein_mask = seg > 0
     total_vein_volume_mm3 = float(np.count_nonzero(vein_mask) * voxel_volume_mm3)
 
+    # Pre-calculate bounding boxes for all present labels to drastically reduce array sizes
+    bounding_boxes = ndi.find_objects(seg)
+    present_labels = [int(v) for v in np.unique(seg) if v != 0]
+    rows: List[Dict[str, Any]] = []
+
+    for label in present_labels:
+        mask = seg == label
+        values = cta[mask]
+        volume_mm3 = float(np.count_nonzero(mask) * voxel_volume_mm3)
+        n_components = int(ndi.label(mask)[1])
+        
+        # Bounding box extraction with a 1-voxel padding safeguard
+        # Padding ensures distance_transform_edt calculates correctly at the boundary limits
+        slices = bounding_boxes[label - 1]
+        if slices is not None:
+            padded_slices = tuple(
+                slice(max(0, s.start - 1), min(dim, s.stop + 1))
+                for s, dim in zip(slices, mask.shape)
+            )
+            cropped_mask = mask[padded_slices]
+        else:
+            cropped_mask = mask
+
+        max_diameter_mm, mean_diameter_mm, median_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(cropped_mask, spacing)
+
+        rows.append({
+            "case": case_id,
+            "label": label,
+            "structure": LABEL_DICT.get(label, "Unknown"),
+            "volume_mm3": volume_mm3,
+            "total_vein_volume_mm3": total_vein_volume_mm3,
+            "n_connected_components": n_components,
+            "mean_hu_abs": float(np.mean(values)),
+            "median_hu_abs": float(np.median(values)),
+            "std_hu_abs": float(np.std(values)),
+            "p05_hu_abs": float(np.percentile(values, 5)),
+            "p95_hu_abs": float(np.percentile(values, 95)),
+            "max_diameter_mm": max_diameter_mm,
+            "mean_diameter_mm": mean_diameter_mm,
+            "median_diameter_mm": median_diameter_mm,
+            "std_diameter_mm": std_diameter_mm,
+        })
+
+    # Clear heavy full-volume arrays out of memory early
+    del cta
+    del seg
+    gc.collect()
+
+    # Generate ICV mask
     icv_mask = build_icv_mask(ts_dir, vein_mask)
     icv_volume_mm3 = float(np.count_nonzero(icv_mask) * voxel_volume_mm3)
 
+    # Save ICV mask
     case_results_dir.mkdir(parents=True, exist_ok=True)
     icv_mask_path = case_results_dir / f"icv_mask_{case_id}.nii.gz"
     nib.save(
         nib.Nifti1Image(icv_mask.astype(np.uint8), cta_nii.affine, cta_nii.header),
         str(icv_mask_path),
     )
+    
+    del icv_mask
+    gc.collect()
 
-    rows = []
-    for label in sorted(int(v) for v in np.unique(seg) if v != 0):
-        mask = seg == label
-        values = cta[mask]
-        n_components = int(ndi.label(mask)[1])
-        volume_mm3 = float(np.count_nonzero(mask) * voxel_volume_mm3)
-        max_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(mask, spacing)
+    # Retrieve SSS mean HU for reference calculations (label 5)
+    sss_mean_hu = next((r["mean_hu_abs"] for r in rows if r["label"] == 5), 0.0)
+    if sss_mean_hu == 0.0:
+        print("  [WARNING] SSS (label 5) not found or SSS mean HU is zero. Using NaN for SSS-referenced HU features.")
 
-        rows.append(
-            {
-                "case": case_id,
-                "label": label,
-                "structure": LABEL_DICT.get(label, "Unknown"),
-                "volume_mm3": volume_mm3,
-                "total_vein_volume_mm3": total_vein_volume_mm3,
-                "icv_volume_mm3": icv_volume_mm3,
-                "n_connected_components": n_components,
-                "mean_hu_abs": float(np.mean(values)),
-                "std_hu_abs": float(np.std(values)),
-                "max_diameter_mm": max_diameter_mm,
-                "std_diameter_mm": std_diameter_mm,
-            }
+    # Populate final referenced calculations
+    for row in rows:
+        row["icv_volume_mm3"] = icv_volume_mm3
+        
+        if sss_mean_hu != 0.0:
+            row["mean_hu_ref_sss"] = row["mean_hu_abs"] / sss_mean_hu
+            row["std_hu_ref_sss"] = row["std_hu_abs"] / sss_mean_hu
+        else:
+            row["mean_hu_ref_sss"] = np.nan
+            row["std_hu_ref_sss"] = np.nan
+
+        row["volume_fraction_all_veins_percent"] = (
+            100.0 * row["volume_mm3"] / total_vein_volume_mm3 if total_vein_volume_mm3 > 0 else np.nan
+        )
+        row["volume_fraction_icv_percent"] = (
+            100.0 * row["volume_mm3"] / icv_volume_mm3 if icv_volume_mm3 > 0 else np.nan
         )
 
     df = pd.DataFrame(rows).sort_values("label").reset_index(drop=True)
-
-    sss_rows = df[df["label"] == 5]
-    if not sss_rows.empty and float(sss_rows["mean_hu_abs"].iloc[0]) != 0.0:
-        sss_mean_hu = float(sss_rows["mean_hu_abs"].iloc[0])
-        df["mean_hu_ref_sss"] = df["mean_hu_abs"] / sss_mean_hu
-        df["std_hu_ref_sss"] = df["std_hu_abs"] / sss_mean_hu
-    else:
-        print("  [WARNING] SSS (label 5) not found or SSS mean HU is zero. Using NaN for SSS-referenced HU features.")
-        df["mean_hu_ref_sss"] = np.nan
-        df["std_hu_ref_sss"] = np.nan
-
-    if total_vein_volume_mm3 > 0:
-        df["volume_fraction_all_veins_percent"] = 100.0 * df["volume_mm3"] / total_vein_volume_mm3
-    else:
-        df["volume_fraction_all_veins_percent"] = np.nan
-
-    if icv_volume_mm3 > 0:
-        df["volume_fraction_icv_percent"] = 100.0 * df["volume_mm3"] / icv_volume_mm3
-    else:
-        df["volume_fraction_icv_percent"] = np.nan
-
-    return df[
-        [
-            "case",
-            "label",
-            "structure",
-            "volume_mm3",
-            "total_vein_volume_mm3",
-            "icv_volume_mm3",
-            "n_connected_components",
-            "mean_hu_abs",
-            "std_hu_abs",
-            "mean_hu_ref_sss",
-            "std_hu_ref_sss",
-            "volume_fraction_all_veins_percent",
-            "volume_fraction_icv_percent",
-            "max_diameter_mm",
-            "std_diameter_mm",
-        ]
-    ]
+    
+    return df[[
+        "case", "label", "structure", "volume_mm3", "total_vein_volume_mm3",
+        "icv_volume_mm3", "n_connected_components", 
+        "mean_hu_abs", "median_hu_abs", "std_hu_abs", "p05_hu_abs", "p95_hu_abs",
+        "mean_hu_ref_sss", "std_hu_ref_sss", "volume_fraction_all_veins_percent",
+        "volume_fraction_icv_percent", 
+        "max_diameter_mm", "mean_diameter_mm", "median_diameter_mm", "std_diameter_mm",
+    ]]
 
 
-def save_failure_log(results_dir: Path, failure_rows: List[dict]) -> None:
+def save_failure_log(results_dir: Path, failure_rows: List[Dict[str, str]]) -> None:
     failure_path = results_dir / "failed_cases.csv"
     if failure_rows:
         pd.DataFrame(failure_rows).to_csv(failure_path, index=False)
@@ -365,6 +380,9 @@ def save_combined_csv(results_dir: Path, dataframes: Sequence[pd.DataFrame]) -> 
         print("No successful cases. Combined CSV was not created.")
 
 
+# -----------------------------------------------------------------------------
+# Main Execution
+# -----------------------------------------------------------------------------
 def main() -> int:
     args = parse_args()
 
@@ -380,7 +398,7 @@ def main() -> int:
     print(f"Project root: {project_root}")
     print(f"CTA dir:       {cta_dir}")
     print(f"SEG dir:       {seg_dir}")
-    print(f"Results dir:   {results_dir}")
+    print(f"Results dir:   {results_dir}\n")
 
     if not cta_dir.exists():
         raise FileNotFoundError(f"CTA directory not found: {cta_dir}")
@@ -389,6 +407,7 @@ def main() -> int:
 
     selected_case_ids = set(args.case_id) if args.case_id is not None else None
     pairs = get_case_pairs(cta_dir, seg_dir, selected_case_ids)
+    
     if not pairs:
         print("No valid CTA/segmentation pairs were found.")
         return 1
@@ -396,7 +415,7 @@ def main() -> int:
     print(f"Found {len(pairs)} case(s) to process.\n")
 
     success_frames: List[pd.DataFrame] = []
-    failure_rows: List[dict] = []
+    failure_rows: List[Dict[str, str]] = []
     n_totalseg_skipped = 0
     n_success = 0
     n_failed = 0
@@ -420,27 +439,27 @@ def main() -> int:
 
             csv_path = case_results_dir / f"{case_id}.csv"
             df.to_csv(csv_path, index=False)
+            
             print(f"  Saved per-case CSV: {csv_path}")
             print(f"  Saved ICV mask:     {case_results_dir / f'icv_mask_{case_id}.nii.gz'}\n")
 
         except Exception as exc:  # noqa: BLE001
             n_failed += 1
             error_text = str(exc)
-            if "MemoryError" in error_text or "returned non-zero exit status" in error_text:
+            
+            if isinstance(exc, (MemoryError, subprocess.CalledProcessError)):
                 short_reason = "TotalSegmentator failed, likely due to memory exhaustion or an internal TotalSegmentator error."
             else:
                 short_reason = error_text.splitlines()[0] if error_text else exc.__class__.__name__
 
-            failure_rows.append(
-                {
-                    "case": case_id,
-                    "cta_file": str(cta_path),
-                    "seg_file": str(seg_path),
-                    "error_type": exc.__class__.__name__,
-                    "reason": short_reason,
-                    "details": error_text,
-                }
-            )
+            failure_rows.append({
+                "case": case_id,
+                "cta_file": str(cta_path),
+                "seg_file": str(seg_path),
+                "error_type": exc.__class__.__name__,
+                "reason": short_reason,
+                "details": error_text,
+            })
             print(f"  [ERROR] Failed to process {case_id}: {short_reason}\n")
             gc.collect()
             continue
@@ -453,9 +472,9 @@ def main() -> int:
     print("\nSummary")
     print("-------")
     print(f"Requested cases:                 {len(pairs)}")
-    print(f"Successfully processed cases:   {n_success}")
-    print(f"Failed cases:                   {n_failed}")
-    print(f"TotalSegmentator skipped cases: {n_totalseg_skipped}")
+    print(f"Successfully processed cases:    {n_success}")
+    print(f"Failed cases:                    {n_failed}")
+    print(f"TotalSegmentator skipped cases:  {n_totalseg_skipped}")
 
     return 0 if n_success > 0 else 1
 
