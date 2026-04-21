@@ -212,17 +212,17 @@ def build_icv_mask(ts_dir: Path, vein_mask: np.ndarray) -> np.ndarray:
     return icv_mask
 
 
-def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, ...]) -> Tuple[float, float, float]:
-    """Calculate max, mean, and std of diameters using Euclidean distance transform, robust to spurs."""
+def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, ...]) -> Tuple[float, float, float, float]:
+    """Calculate max, mean, median, and std of diameters using Euclidean distance transform, robust to spurs."""
     if not np.any(mask):
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
 
     distance_map = ndi.distance_transform_edt(mask, sampling=spacing)
     skeleton = skeletonize(mask)
     diameters = 2.0 * distance_map[skeleton]
 
     if diameters.size == 0:
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
 
     # Filter out near-zero values (likely skeleton spurs touching the surface)
     min_valid_diameter = min(spacing)
@@ -231,7 +231,12 @@ def skeleton_diameter_stats_mm(mask: np.ndarray, spacing: Tuple[float, ...]) -> 
     if valid_diameters.size == 0:
         valid_diameters = diameters # Fallback if the whole vein is tiny
 
-    return float(np.max(valid_diameters)), float(np.mean(valid_diameters)), float(np.std(valid_diameters))
+    return (
+        float(np.max(valid_diameters)),
+        float(np.mean(valid_diameters)),
+        float(np.median(valid_diameters)),
+        float(np.std(valid_diameters))
+    )
 
 
 def extract_case_features(
@@ -280,7 +285,7 @@ def extract_case_features(
         else:
             cropped_mask = mask
 
-        max_diameter_mm, mean_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(cropped_mask, spacing)
+        max_diameter_mm, mean_diameter_mm, median_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(cropped_mask, spacing)
 
         rows.append({
             "case": case_id,
@@ -290,9 +295,13 @@ def extract_case_features(
             "total_vein_volume_mm3": total_vein_volume_mm3,
             "n_connected_components": n_components,
             "mean_hu_abs": float(np.mean(values)),
+            "median_hu_abs": float(np.median(values)),
             "std_hu_abs": float(np.std(values)),
+            "p05_hu_abs": float(np.percentile(values, 5)),
+            "p95_hu_abs": float(np.percentile(values, 95)),
             "max_diameter_mm": max_diameter_mm,
             "mean_diameter_mm": mean_diameter_mm,
+            "median_diameter_mm": median_diameter_mm,
             "std_diameter_mm": std_diameter_mm,
         })
 
@@ -343,9 +352,11 @@ def extract_case_features(
     
     return df[[
         "case", "label", "structure", "volume_mm3", "total_vein_volume_mm3",
-        "icv_volume_mm3", "n_connected_components", "mean_hu_abs", "std_hu_abs",
+        "icv_volume_mm3", "n_connected_components", 
+        "mean_hu_abs", "median_hu_abs", "std_hu_abs", "p05_hu_abs", "p95_hu_abs",
         "mean_hu_ref_sss", "std_hu_ref_sss", "volume_fraction_all_veins_percent",
-        "volume_fraction_icv_percent", "max_diameter_mm", "mean_diameter_mm", "std_diameter_mm",
+        "volume_fraction_icv_percent", 
+        "max_diameter_mm", "mean_diameter_mm", "median_diameter_mm", "std_diameter_mm",
     ]]
 
 
