@@ -200,7 +200,7 @@ def build_icv_mask(ts_dir: Path, vein_mask: np.ndarray) -> np.ndarray:
     if not reference_file.exists():
         raise FileNotFoundError(f"Cannot build ICV mask because {reference_file} was not found.")
 
-    icv_mask = vein_mask.copy()
+    icv_mask = np.array(vein_mask, dtype=bool)
 
     for filename in ICV_STRUCTURE_FILES:
         path = ts_dir / filename
@@ -257,6 +257,51 @@ def extract_case_features(
     vein_mask = seg > 0
     total_vein_volume_mm3 = float(np.count_nonzero(vein_mask) * voxel_volume_mm3)
 
+    # Pre-calculate bounding boxes for all present labels to drastically reduce array sizes
+    bounding_boxes = ndi.find_objects(seg)
+    present_labels = [int(v) for v in np.unique(seg) if v != 0]
+    rows: List[Dict[str, Any]] = []
+
+    for label in present_labels:
+        mask = seg == label
+        values = cta[mask]
+        volume_mm3 = float(np.count_nonzero(mask) * voxel_volume_mm3)
+        n_components = int(ndi.label(mask)[1])
+        
+        # Bounding box extraction with a 1-voxel padding safeguard
+        # Padding ensures distance_transform_edt calculates correctly at the boundary limits
+        slices = bounding_boxes[label - 1]
+        if slices is not None:
+            padded_slices = tuple(
+                slice(max(0, s.start - 1), min(dim, s.stop + 1))
+                for s, dim in zip(slices, mask.shape)
+            )
+            cropped_mask = mask[padded_slices]
+        else:
+            cropped_mask = mask
+
+        max_diameter_mm, mean_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(cropped_mask, spacing)
+
+        rows.append({
+            "case": case_id,
+            "label": label,
+            "structure": LABEL_DICT.get(label, "Unknown"),
+            "volume_mm3": volume_mm3,
+            "total_vein_volume_mm3": total_vein_volume_mm3,
+            "n_connected_components": n_components,
+            "mean_hu_abs": float(np.mean(values)),
+            "std_hu_abs": float(np.std(values)),
+            "max_diameter_mm": max_diameter_mm,
+            "mean_diameter_mm": mean_diameter_mm,
+            "std_diameter_mm": std_diameter_mm,
+        })
+
+    # Clear heavy full-volume arrays out of memory early
+    del cta
+    del seg
+    gc.collect()
+
+    # Generate ICV mask
     icv_mask = build_icv_mask(ts_dir, vein_mask)
     icv_volume_mm3 = float(np.count_nonzero(icv_mask) * voxel_volume_mm3)
 
@@ -267,38 +312,19 @@ def extract_case_features(
         nib.Nifti1Image(icv_mask.astype(np.uint8), cta_nii.affine, cta_nii.header),
         str(icv_mask_path),
     )
-
-    rows: List[Dict[str, Any]] = []
-    present_labels = [int(v) for v in np.unique(seg) if v != 0]
-
-    for label in present_labels:
-        mask = seg == label
-        values = cta[mask]
-        volume_mm3 = float(np.count_nonzero(mask) * voxel_volume_mm3)
-        max_diameter_mm, mean_diameter_mm, std_diameter_mm = skeleton_diameter_stats_mm(mask, spacing)
-
-        rows.append({
-            "case": case_id,
-            "label": label,
-            "structure": LABEL_DICT.get(label, "Unknown"),
-            "volume_mm3": volume_mm3,
-            "total_vein_volume_mm3": total_vein_volume_mm3,
-            "icv_volume_mm3": icv_volume_mm3,
-            "n_connected_components": int(ndi.label(mask)[1]),
-            "mean_hu_abs": float(np.mean(values)),
-            "std_hu_abs": float(np.std(values)),
-            "max_diameter_mm": max_diameter_mm,
-            "mean_diameter_mm": mean_diameter_mm,
-            "std_diameter_mm": std_diameter_mm,
-        })
+    
+    del icv_mask
+    gc.collect()
 
     # Retrieve SSS mean HU for reference calculations (label 5)
     sss_mean_hu = next((r["mean_hu_abs"] for r in rows if r["label"] == 5), 0.0)
     if sss_mean_hu == 0.0:
         print("  [WARNING] SSS (label 5) not found or SSS mean HU is zero. Using NaN for SSS-referenced HU features.")
 
-    # Populate final referenced calculations directly into dictionaries
+    # Populate final referenced calculations
     for row in rows:
+        row["icv_volume_mm3"] = icv_volume_mm3
+        
         if sss_mean_hu != 0.0:
             row["mean_hu_ref_sss"] = row["mean_hu_abs"] / sss_mean_hu
             row["std_hu_ref_sss"] = row["std_hu_abs"] / sss_mean_hu
