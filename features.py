@@ -30,6 +30,9 @@ Process all matched cases:
 Process selected cases:
     python features.py --case-id sub-stroke_0002 sub-stroke_0004
 
+Process a range of cases:
+    python features.py --case-range 20 25
+
 Force re-running TotalSegmentator for selected cases:
     python features.py --case-id sub-stroke_0002 --force-totalseg
 """
@@ -147,6 +150,25 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help="One or more case IDs to process. Omit to process all matched pairs.",
+    )
+    parser.add_argument(
+        "--case-range",
+        type=int,
+        nargs=2,
+        metavar=('START', 'END'),
+        help="Process a range of cases by their integer IDs (inclusive). Example: --case-range 20 25",
+    )
+    parser.add_argument(
+        "--case-prefix",
+        type=str,
+        default="sub-stroke_",
+        help="Prefix for generated case IDs when using --case-range. Default: 'sub-stroke_'",
+    )
+    parser.add_argument(
+        "--case-pad",
+        type=int,
+        default=4,
+        help="Zero-padding length for generated case IDs when using --case-range. Default: 4",
     )
     parser.add_argument(
         "--force-totalseg",
@@ -405,7 +427,20 @@ def main() -> int:
     if not seg_dir.exists():
         raise FileNotFoundError(f"Segmentation directory not found: {seg_dir}")
 
-    selected_case_ids = set(args.case_id) if args.case_id is not None else None
+    # Initialize an empty set to gather all targeted case IDs
+    selected_case_ids = set(args.case_id) if args.case_id is not None else set()
+
+    # Generate the range if provided and add to the set
+    if args.case_range is not None:
+        start, end = args.case_range
+        for i in range(start, end + 1):
+            case_id = f"{args.case_prefix}{i:0{args.case_pad}d}"
+            selected_case_ids.add(case_id)
+
+    # Revert to None if the set is empty (meaning "process all cases")
+    if not selected_case_ids:
+        selected_case_ids = None
+
     pairs = get_case_pairs(cta_dir, seg_dir, selected_case_ids)
     
     if not pairs:
