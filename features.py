@@ -25,13 +25,13 @@ Expected default project structure:
 Examples
 --------
 Process all matched cases:
-    python process_vein_features.py
+    python features.py
 
 Process selected cases:
-    python process_vein_features.py --case-id sub-stroke_0002 sub-stroke_0004
+    python features.py --case-id sub-stroke_0002 sub-stroke_0004
 
 Force re-running TotalSegmentator for selected cases:
-    python process_vein_features.py --case-id sub-stroke_0002 --force-totalseg
+    python features.py --case-id sub-stroke_0002 --force-totalseg
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def check_conda_environment(required_env: str = "vmtk_env") -> None:
             f"Current environment: {current_env or 'none'}.\n\n"
             "Please activate the environment manually and run the script again:\n"
             f"    conda activate {required_env}\n"
-            "    python process_vein_features.py\n"
+            "    python features.py\n"
         )
 
 
